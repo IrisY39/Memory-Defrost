@@ -375,5 +375,11 @@ MIT
 ---
 
 <p align="center">
+  <a href="https://buymeacoffee.com/neige_neige">
+    <img src="https://img.shields.io/badge/Buy%20Me%20A%20Coffee-yellow?style=flat-square&logo=buy-me-a-coffee">
+  </a>
+</p>
+
+<p align="center">
   <sub>Built with 🌀 <a href="https://github.com/anthropics/claude-code">Claude Code</a></sub>
 </p>
