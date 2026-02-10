@@ -430,8 +430,8 @@ async def chat_completions(request):
 
         return Response(
             upstream_resp.content,
-            status=upstream_resp.status_code,
-            content_type=upstream_resp.headers.get("Content-Type", "application/json")
+            status_code=upstream_resp.status_code,
+            media_type=upstream_resp.headers.get("Content-Type", "application/json")
         )
 
     except Exception as e:
