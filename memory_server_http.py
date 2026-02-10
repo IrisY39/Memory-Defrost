@@ -68,7 +68,7 @@ def init_memory_cache():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT id, content, tags, embedding, priority, category, created_at, updated_at FROM memories ORDER BY id")
+        cur.execute("SELECT id, content, tags, embedding, priority, created_at, updated_at FROM memories ORDER BY id")
         rows = cur.fetchall()
         cur.close()
         conn.close()
@@ -81,7 +81,6 @@ def init_memory_cache():
                 "tags": row["tags"] or [],
                 "embedding": row["embedding"] or [],
                 "priority": row.get("priority", 3) or 3,
-                "category": row.get("category", "general") or "general",
                 "created_at": row["created_at"].isoformat() if row["created_at"] else None,
                 "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None
             })
@@ -134,7 +133,6 @@ def init_db():
             tags TEXT[] DEFAULT '{}',
             embedding FLOAT8[],
             priority INTEGER DEFAULT 3,
-            category VARCHAR(50) DEFAULT 'general',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -153,12 +151,6 @@ def init_db():
                 WHERE table_name = 'memories' AND column_name = 'priority'
             ) THEN
                 ALTER TABLE memories ADD COLUMN priority INTEGER DEFAULT 3;
-            END IF;
-            IF NOT EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name = 'memories' AND column_name = 'category'
-            ) THEN
-                ALTER TABLE memories ADD COLUMN category VARCHAR(50) DEFAULT 'general';
             END IF;
             IF NOT EXISTS (
                 SELECT 1 FROM information_schema.columns
@@ -220,12 +212,10 @@ def cosine_similarity(vec1: list[float], vec2: list[float]) -> float:
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 
-def search_memories(query: str, memories: list[dict], category: str = None) -> list[tuple[float, dict]]:
-    if category:
-        memories = [m for m in memories if m.get("category", "general") == category]
+def search_memories(query: str, memories: list[dict]) -> list[tuple[float, dict]]:
 
     if SEARCH_MODE == "keyword":
-        return search_memories_keyword(query, memories, MAX_RESULTS, category=None)
+        return search_memories_keyword(query, memories, MAX_RESULTS)
 
     print(f"[SEARCH] mode=semantic query='{query[:80]}'", flush=True)
     all_queries = [query]
@@ -272,9 +262,7 @@ def search_memories(query: str, memories: list[dict], category: str = None) -> l
     return results[:MAX_RESULTS]
 
 
-def search_memories_keyword(query: str, memories: list[dict], top_k: int = None, category: str = None) -> list[tuple[float, dict]]:
-    if category:
-        memories = [m for m in memories if m.get("category", "general") == category]
+def search_memories_keyword(query: str, memories: list[dict], top_k: int = None) -> list[tuple[float, dict]]:
 
     query_lower = query.lower()
     scored = []
@@ -340,10 +328,10 @@ def extract_query_from_payload(payload: dict) -> str:
     return ""
 
 
-def recall_memory_text(query: str, category: str | None = None, top_k: int | None = None) -> str:
+def recall_memory_text(query: str, top_k: int | None = None) -> str:
     try:
         memories = get_cached_memories()
-        results = search_memories(query, memories, category=category)
+        results = search_memories(query, memories)
         results = results[: (top_k or MAX_RESULTS)]
         lines = [m.get("content", "") for _, m in results if m.get("content")]
         return "\n".join(lines).strip()
@@ -443,7 +431,6 @@ async def recall_http(request):
     if not query:
         return JSONResponse({"error": "query is required"}, status_code=400)
 
-    category = body.get("category")
     try:
         top_k = int(body.get("top_k", MAX_RESULTS))
     except Exception:
@@ -452,7 +439,7 @@ async def recall_http(request):
         top_k = MAX_RESULTS
 
     memories = get_cached_memories()
-    results = search_memories(query, memories, category=category)
+    results = search_memories(query, memories)
     results = results[:top_k]
 
     items = []
@@ -462,7 +449,6 @@ async def recall_http(request):
             "content": m.get("content"),
             "tags": m.get("tags", []),
             "priority": m.get("priority", 3),
-            "category": m.get("category", "general"),
             "score": score
         })
 
