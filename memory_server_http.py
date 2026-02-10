@@ -120,6 +120,214 @@ def remove_from_cache(memory_id: int):
     global _memory_cache
     _memory_cache = [m for m in _memory_cache if m["id"] != memory_id]
 
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
+
+def init_db():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS memories (
+            id SERIAL PRIMARY KEY,
+            content TEXT NOT NULL,
+            tags TEXT[] DEFAULT '{}',
+            embedding FLOAT8[],
+            priority INTEGER DEFAULT 3,
+            category VARCHAR(50) DEFAULT 'general',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cur.execute("""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'memories' AND column_name = 'embedding'
+            ) THEN
+                ALTER TABLE memories ADD COLUMN embedding FLOAT8[];
+            END IF;
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'memories' AND column_name = 'priority'
+            ) THEN
+                ALTER TABLE memories ADD COLUMN priority INTEGER DEFAULT 3;
+            END IF;
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'memories' AND column_name = 'category'
+            ) THEN
+                ALTER TABLE memories ADD COLUMN category VARCHAR(50) DEFAULT 'general';
+            END IF;
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'memories' AND column_name = 'updated_at'
+            ) THEN
+                ALTER TABLE memories ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+            END IF;
+        END $$;
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def get_embedding(text: str, use_cache: bool = True) -> list[float]:
+    global EMBEDDING_CACHE
+
+    cache_key = text[:200].strip().lower()
+    if use_cache and cache_key in EMBEDDING_CACHE:
+        print("[EMBEDDING] cache hit", flush=True)
+        return EMBEDDING_CACHE[cache_key]
+
+    if not GEMINI_API_KEY:
+        print("[EMBEDDING] GEMINI_API_KEY missing", flush=True)
+        return []
+
+    try:
+        url = f"{GEMINI_EMBEDDING_URL}?key={GEMINI_API_KEY}"
+        payload = {"content": {"parts": [{"text": text}]}}
+        response = requests.post(url, json=payload, timeout=10)
+
+        if response.status_code == 200:
+            result = response.json()
+            embedding = result.get("embedding", {}).get("values", [])
+            if use_cache and embedding:
+                if len(EMBEDDING_CACHE) >= EMBEDDING_CACHE_MAX_SIZE:
+                    oldest_key = next(iter(EMBEDDING_CACHE))
+                    del EMBEDDING_CACHE[oldest_key]
+                EMBEDDING_CACHE[cache_key] = embedding
+            return embedding
+        else:
+            print("[EMBEDDING] API error:", response.status_code, flush=True)
+    except Exception as e:
+        print("[EMBEDDING] error:", e, flush=True)
+    return []
+
+
+def translate_query(query: str) -> list[str]:
+    if not GEMINI_API_KEY:
+        return []
+
+    is_ascii = all(ord(c) < 128 for c in query.replace(" ", ""))
+
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+        if is_ascii:
+            prompt = f"Translate '{query}' to Chinese and Japanese. Return ONLY the translations, one per line, no explanations."
+        else:
+            prompt = f"Translate '{query}' to English. Return ONLY the translation, no explanations."
+
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"maxOutputTokens": 50, "temperature": 0}
+        }
+        response = requests.post(url, json=payload, timeout=5)
+
+        if response.status_code == 200:
+            result = response.json()
+            text = result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+            translations = [t.strip() for t in text.strip().split("\n") if t.strip() and t.strip() != query]
+            return translations[:3]
+    except Exception as e:
+        print("[TRANSLATE] error:", e, flush=True)
+
+    return []
+
+
+def cosine_similarity(vec1: list[float], vec2: list[float]) -> float:
+    if not vec1 or not vec2:
+        return 0.0
+    a = np.array(vec1)
+    b = np.array(vec2)
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+
+def search_memories(query: str, memories: list[dict], category: str = None) -> list[tuple[float, dict]]:
+    if category:
+        memories = [m for m in memories if m.get("category", "general") == category]
+
+    if SEARCH_MODE == "keyword":
+        return search_memories_keyword(query, memories, MAX_RESULTS, category=None)
+
+    all_queries = [query] + translate_query(query)
+
+    scores_by_id = {}
+    for q in all_queries:
+        q_embedding = get_embedding(q)
+        q_lower = q.lower()
+
+        for m in memories:
+            memory_id = m["id"]
+            semantic_score = 0
+            keyword_score = 0
+
+            if q_embedding and m.get("embedding"):
+                semantic_score = cosine_similarity(q_embedding, m["embedding"])
+
+            content_lower = m["content"].lower()
+            if q_lower in content_lower:
+                keyword_score += 0.3
+
+            for tag in m.get("tags", []):
+                if q_lower in tag.lower() or tag.lower() in q_lower:
+                    keyword_score += 0.25
+
+            for word in q_lower.split():
+                if len(word) >= 2 and word in content_lower:
+                    keyword_score += 0.1
+
+            priority_boost = (6 - m.get("priority", 3)) * 0.05
+
+            base_score = max(semantic_score, keyword_score)
+            if semantic_score > 0.3 and keyword_score > 0:
+                base_score += 0.1
+
+            final_score = base_score + priority_boost
+
+            if final_score > 0.25:
+                if memory_id not in scores_by_id or final_score > scores_by_id[memory_id][0]:
+                    scores_by_id[memory_id] = (final_score, m)
+
+    results = list(scores_by_id.values())
+    results.sort(key=lambda x: x[0], reverse=True)
+    return results[:MAX_RESULTS]
+
+
+def search_memories_keyword(query: str, memories: list[dict], top_k: int = None, category: str = None) -> list[tuple[float, dict]]:
+    if category:
+        memories = [m for m in memories if m.get("category", "general") == category]
+
+    query_lower = query.lower()
+    scored = []
+
+    for m in memories:
+        score = 0
+        content_lower = m["content"].lower()
+
+        if query_lower in content_lower:
+            score += 10
+
+        for tag in m.get("tags", []):
+            if query_lower in tag.lower():
+                score += 5
+
+        for word in query_lower.split():
+            if word in content_lower:
+                score += 2
+
+        priority_boost = (6 - m.get("priority", 3))
+        score += priority_boost
+
+        if score > 0:
+            scored.append((score, m))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[: top_k or MAX_RESULTS]
+
+
+
 async def index(request):
     return Response("Memory Server is running!", media_type="text/plain")
 
