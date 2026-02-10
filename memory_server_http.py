@@ -393,9 +393,11 @@ def inject_memory_into_messages(payload: dict, memory_text: str) -> None:
                 msg["content"] = existing.rstrip() + "\n\n" + memory_block
             else:
                 msg["content"] = memory_block
+            print("injected memories:\n" + memory_text[:1000])
             return
 
     messages.insert(0, {"role": "system", "content": memory_block})
+    print("injected memories:\n" + memory_text[:1000])
 
 
 async def chat_completions(request):
