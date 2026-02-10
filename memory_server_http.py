@@ -186,6 +186,7 @@ def get_embedding(text: str, use_cache: bool = True) -> list[float]:
         return []
 
     try:
+        print(f"[EMBEDDING] calling api for text: {text[:50]}", flush=True)
         url = f"{GEMINI_EMBEDDING_URL}?key={GEMINI_API_KEY}"
         payload = {"content": {"parts": [{"text": text}]}}
         response = requests.post(url, json=payload, timeout=10)
@@ -198,6 +199,10 @@ def get_embedding(text: str, use_cache: bool = True) -> list[float]:
                     oldest_key = next(iter(EMBEDDING_CACHE))
                     del EMBEDDING_CACHE[oldest_key]
                 EMBEDDING_CACHE[cache_key] = embedding
+            if embedding:
+                print(f"[EMBEDDING] ok (dim={len(embedding)})", flush=True)
+            else:
+                print("[EMBEDDING] empty embedding", flush=True)
             return embedding
         else:
             print("[EMBEDDING] API error:", response.status_code, flush=True)
@@ -205,35 +210,6 @@ def get_embedding(text: str, use_cache: bool = True) -> list[float]:
         print("[EMBEDDING] error:", e, flush=True)
     return []
 
-
-def translate_query(query: str) -> list[str]:
-    if not GEMINI_API_KEY:
-        return []
-
-    is_ascii = all(ord(c) < 128 for c in query.replace(" ", ""))
-
-    try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-        if is_ascii:
-            prompt = f"Translate '{query}' to Chinese and Japanese. Return ONLY the translations, one per line, no explanations."
-        else:
-            prompt = f"Translate '{query}' to English. Return ONLY the translation, no explanations."
-
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"maxOutputTokens": 50, "temperature": 0}
-        }
-        response = requests.post(url, json=payload, timeout=5)
-
-        if response.status_code == 200:
-            result = response.json()
-            text = result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-            translations = [t.strip() for t in text.strip().split("\n") if t.strip() and t.strip() != query]
-            return translations[:3]
-    except Exception as e:
-        print("[TRANSLATE] error:", e, flush=True)
-
-    return []
 
 
 def cosine_similarity(vec1: list[float], vec2: list[float]) -> float:
@@ -251,7 +227,8 @@ def search_memories(query: str, memories: list[dict], category: str = None) -> l
     if SEARCH_MODE == "keyword":
         return search_memories_keyword(query, memories, MAX_RESULTS, category=None)
 
-    all_queries = [query] + translate_query(query)
+    print(f"[SEARCH] mode=semantic query='{query[:80]}'", flush=True)
+    all_queries = [query]
 
     scores_by_id = {}
     for q in all_queries:
