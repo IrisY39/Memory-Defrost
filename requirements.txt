@@ -3,4 +3,5 @@ starlette
 uvicorn
 psycopg2-binary
 numpy
-requests
+flask==2.2.5
+requests==2.31.0
