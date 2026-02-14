@@ -4,6 +4,7 @@
 # HTTP memory service (no MCP)
 
 import os
+import json
 import requests
 import numpy as np
 from datetime import datetime
@@ -479,6 +480,14 @@ async def health_check(request):
     })
 
 
+async def sse_compat(request):
+    # Compatibility endpoint for clients still probing legacy MCP SSE.
+    return JSONResponse({
+        "status": "deprecated",
+        "message": "This gateway uses OpenAI-compatible HTTP routes: /v1/models and /v1/chat/completions."
+    }, status_code=410)
+
+
 
 async def recall_http(request):
     """REST: recall memories by query."""
@@ -523,6 +532,7 @@ async def recall_http(request):
 app = Starlette(
     routes=[
         Route("/", index),
+        Route("/sse", sse_compat, methods=["GET"]),
         Route("/v1/models", list_models, methods=["GET"]),
         Route("/v1/chat/completions", chat_completions, methods=["POST"]),
         Route("/health", health_check),
