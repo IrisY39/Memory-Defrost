@@ -25,6 +25,7 @@ GEMINI_EMBEDDING_URL = "https://generativelanguage.googleapis.com/v1beta/models/
 UPSTREAM_API_KEY = os.environ.get("OPENAI_API_KEY")
 UPSTREAM_BASE_URL = os.environ.get("BASE_URL")
 UPSTREAM_MODEL_NAME = os.environ.get("MODEL_NAME")
+MODELS_JSON = os.environ.get("MODELS_JSON")
 
 # Memory injection config
 MEMORY_PREFIX = os.environ.get(
@@ -298,16 +299,12 @@ async def index(request):
 
 
 async def list_models(request):
-    if not UPSTREAM_MODEL_NAME:
-        return JSONResponse({"error": "MODEL_NAME is required"}, status_code=500)
+    models = _get_model_registry()
+    if not models["data"]:
+        return JSONResponse({"error": "MODEL_NAME or MODELS_JSON is required"}, status_code=500)
     return JSONResponse({
         "object": "list",
-        "data": [{
-            "id": UPSTREAM_MODEL_NAME,
-            "object": "model",
-            "created": 1677858242,
-            "owned_by": "memory-gateway"
-        }]
+        "data": models["data"]
     })
 
 
@@ -369,10 +366,19 @@ async def chat_completions(request):
     try:
         payload = await request.json()
 
-        if not UPSTREAM_API_KEY or not UPSTREAM_BASE_URL or not UPSTREAM_MODEL_NAME:
-            return JSONResponse({"error": "OPENAI_API_KEY/BASE_URL/MODEL_NAME required"}, status_code=500)
+        model_registry = _get_model_registry()
+        if not model_registry["data"]:
+            return JSONResponse({"error": "MODEL_NAME or MODELS_JSON is required"}, status_code=500)
 
-        payload["model"] = payload.get("model", UPSTREAM_MODEL_NAME)
+        requested_model = payload.get("model") or model_registry["default"]
+        if not requested_model:
+            return JSONResponse({"error": "model is required"}, status_code=400)
+
+        model_cfg = model_registry["by_id"].get(requested_model)
+        if not model_cfg:
+            return JSONResponse({"error": f"unknown model: {requested_model}"}, status_code=400)
+
+        payload["model"] = requested_model
 
         query = extract_query_from_payload(payload)
         if query:
@@ -381,12 +387,12 @@ async def chat_completions(request):
                 inject_memory_into_messages(payload, memory_text)
 
         headers = {
-            "Authorization": f"Bearer {UPSTREAM_API_KEY}",
+            "Authorization": f"Bearer {model_cfg['api_key']}",
             "Content-Type": "application/json"
         }
 
         upstream_resp = requests.post(
-            f"{UPSTREAM_BASE_URL}/chat/completions",
+            f"{model_cfg['base_url']}/chat/completions",
             headers=headers,
             json=payload,
             timeout=60
@@ -406,6 +412,60 @@ async def chat_completions(request):
         if not MEMORY_FAIL_OPEN:
             raise
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+def _get_model_registry() -> dict:
+    # MODELS_JSON format:
+    # {
+    #   "default": "modelA",
+    #   "models": {
+    #     "modelA": {"base_url": "...", "api_key": "..."},
+    #     "modelB": {"base_url": "...", "api_key": "..."}
+    #   }
+    # }
+    if MODELS_JSON:
+        try:
+            data = json.loads(MODELS_JSON)
+            models = data.get("models", {})
+            items = []
+            by_id = {}
+            for model_id, cfg in models.items():
+                base_url = cfg.get("base_url")
+                api_key = cfg.get("api_key")
+                if not model_id or not base_url or not api_key:
+                    continue
+                by_id[model_id] = {"base_url": base_url, "api_key": api_key}
+                items.append({
+                    "id": model_id,
+                    "object": "model",
+                    "created": 1677858242,
+                    "owned_by": "memory-gateway"
+                })
+            return {
+                "default": data.get("default") if data.get("default") in by_id else (items[0]["id"] if items else None),
+                "data": items,
+                "by_id": by_id
+            }
+        except Exception as e:
+            print("model registry error:", e)
+
+    if UPSTREAM_API_KEY and UPSTREAM_BASE_URL and UPSTREAM_MODEL_NAME:
+        return {
+            "default": UPSTREAM_MODEL_NAME,
+            "data": [{
+                "id": UPSTREAM_MODEL_NAME,
+                "object": "model",
+                "created": 1677858242,
+                "owned_by": "memory-gateway"
+            }],
+            "by_id": {
+                UPSTREAM_MODEL_NAME: {
+                    "base_url": UPSTREAM_BASE_URL,
+                    "api_key": UPSTREAM_API_KEY
+                }
+            }
+        }
+    return {"default": None, "data": [], "by_id": {}}
 
 
 async def health_check(request):
