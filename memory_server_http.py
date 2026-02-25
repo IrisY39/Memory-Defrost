@@ -10,7 +10,7 @@ import numpy as np
 from datetime import datetime
 from starlette.applications import Starlette
 from starlette.routing import Route
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 import uvicorn
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -27,6 +27,7 @@ UPSTREAM_API_KEY = os.environ.get("OPENAI_API_KEY")
 UPSTREAM_BASE_URL = os.environ.get("BASE_URL")
 UPSTREAM_MODEL_NAME = os.environ.get("MODEL_NAME")
 MODELS_JSON = os.environ.get("MODELS_JSON")
+UPSTREAM_TIMEOUT = int(os.environ.get("UPSTREAM_TIMEOUT", "120"))
 
 # Memory injection config
 MEMORY_PREFIX = os.environ.get(
@@ -392,11 +393,44 @@ async def chat_completions(request):
             "Content-Type": "application/json"
         }
 
+        is_stream = bool(payload.get("stream"))
+
+        if is_stream:
+            upstream_resp = requests.post(
+                f"{model_cfg['base_url']}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=UPSTREAM_TIMEOUT,
+                stream=True
+            )
+            print("upstream status:", upstream_resp.status_code)
+
+            if upstream_resp.status_code >= 400:
+                return Response(
+                    upstream_resp.content,
+                    status_code=upstream_resp.status_code,
+                    media_type=upstream_resp.headers.get("Content-Type", "application/json")
+                )
+
+            def generate():
+                try:
+                    for chunk in upstream_resp.iter_content(chunk_size=1024):
+                        if chunk:
+                            yield chunk
+                finally:
+                    upstream_resp.close()
+
+            return StreamingResponse(
+                generate(),
+                status_code=upstream_resp.status_code,
+                media_type=upstream_resp.headers.get("Content-Type", "text/event-stream")
+            )
+
         upstream_resp = requests.post(
             f"{model_cfg['base_url']}/chat/completions",
             headers=headers,
             json=payload,
-            timeout=60
+            timeout=UPSTREAM_TIMEOUT
         )
 
         print("upstream status:", upstream_resp.status_code)
