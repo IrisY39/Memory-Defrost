@@ -1,6 +1,6 @@
-# memory_server_http.py
-# 记忆服务 - 云端版本 (HTTP 传输)
-# 使用 PostgreSQL + Gemini Embedding 语义搜索
+﻿# memory_server_http.py
+# 璁板繂鏈嶅姟 - 浜戠鐗堟湰 (HTTP 浼犺緭)
+# 浣跨敤 PostgreSQL + Gemini Embedding 璇箟鎼滅储
 # HTTP memory service (no MCP)
 
 import os
@@ -17,11 +17,11 @@ import uvicorn
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-# 配置
+# 閰嶇疆
 DATABASE_URL = os.environ.get("DATABASE_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-# 使用最新的 gemini-embedding-001（3072维，100+语言支持）
-# 注意：如果从 text-embedding-004 切换，需要重新生成所有 embedding
+# 浣跨敤鏈€鏂扮殑 gemini-embedding-001锛?072缁达紝100+璇█鏀寔锛?
+# 娉ㄦ剰锛氬鏋滀粠 text-embedding-004 鍒囨崲锛岄渶瑕侀噸鏂扮敓鎴愭墍鏈?embedding
 GEMINI_EMBEDDING_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent"
 
 # Gateway upstream config (for /v1/chat/completions)
@@ -40,27 +40,27 @@ MEMORY_PREFIX = os.environ.get(
 MEMORY_FAIL_OPEN = os.environ.get("MEMORY_FAIL_OPEN", "1") not in ("0", "false", "False")
 
 
-# 工具名称前缀（用于区分多个实例，避免重复声明错误）
+# 宸ュ叿鍚嶇О鍓嶇紑锛堢敤浜庡尯鍒嗗涓疄渚嬶紝閬垮厤閲嶅澹版槑閿欒锛?
 
-# Embedding 缓存（减少 API 调用，加速响应）
+# Embedding 缂撳瓨锛堝噺灏?API 璋冪敤锛屽姞閫熷搷搴旓級
 EMBEDDING_CACHE = {}
-EMBEDDING_CACHE_MAX_SIZE = 100  # 最多缓存 100 条
+EMBEDDING_CACHE_MAX_SIZE = 100  # 鏈€澶氱紦瀛?100 鏉?
 
-# 搜索模式：semantic（语义搜索，智能但慢）或 keyword（关键词搜索，快但需精确匹配）
-# 设置环境变量 SEARCH_MODE 来切换，默认为 semantic
+# 鎼滅储妯″紡锛歴emantic锛堣涔夋悳绱紝鏅鸿兘浣嗘參锛夋垨 keyword锛堝叧閿瘝鎼滅储锛屽揩浣嗛渶绮剧‘鍖归厤锛?
+# 璁剧疆鐜鍙橀噺 SEARCH_MODE 鏉ュ垏鎹紝榛樿涓?semantic
 SEARCH_MODE = os.environ.get("SEARCH_MODE", "semantic").lower()
 DEBUG_RECALL_SCORES = os.environ.get("DEBUG_RECALL_SCORES", "0") in ("1", "true", "True")
 
-# 返回结果数量（默认 3 条，减少传输和处理时间）
+# 杩斿洖缁撴灉鏁伴噺锛堥粯璁?3 鏉★紝鍑忓皯浼犺緭鍜屽鐞嗘椂闂达級
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "3"))
 
-# 渐进式注入：追踪 recall_memory 调用次数
-# 简单实现：基于时间间隔判断是否为新会话
+# 娓愯繘寮忔敞鍏ワ細杩借釜 recall_memory 璋冪敤娆℃暟
+# 绠€鍗曞疄鐜帮細鍩轰簬鏃堕棿闂撮殧鍒ゆ柇鏄惁涓烘柊浼氳瘽
 RECALL_COUNTER = {"count": 0, "last_call": None}
-RECALL_SESSION_TIMEOUT = 300  # 5 分钟无调用视为新会话
+RECALL_SESSION_TIMEOUT = 300  # 5 鍒嗛挓鏃犺皟鐢ㄨ涓烘柊浼氳瘽
 
-# ========== 记忆缓存 ==========
-# 缓存所有记忆到内存，避免每次 recall 都查数据库
+# ========== 璁板繂缂撳瓨 ==========
+# 缂撳瓨鎵€鏈夎蹇嗗埌鍐呭瓨锛岄伩鍏嶆瘡娆?recall 閮芥煡鏁版嵁搴?
 _memory_cache: list[dict] = []
 _cache_initialized = False
 
@@ -76,7 +76,7 @@ REQUEST_DEDUP_WINDOW_SECONDS = float(os.environ.get("REQUEST_DEDUP_WINDOW_SECOND
 
 
 def init_memory_cache():
-    """初始化记忆缓存（从数据库加载到内存）"""
+    """鍒濆鍖栬蹇嗙紦瀛橈紙浠庢暟鎹簱鍔犺浇鍒板唴瀛橈級"""
     global _memory_cache, _cache_initialized
     if not DATABASE_URL:
         _cache_initialized = True
@@ -102,14 +102,14 @@ def init_memory_cache():
                 "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None
             })
         _cache_initialized = True
-        print(f"[CACHE] 已加载 {len(_memory_cache)} 条记忆到内存", flush=True)
+        print(f"[CACHE] 宸插姞杞?{len(_memory_cache)} 鏉¤蹇嗗埌鍐呭瓨", flush=True)
     except Exception as e:
         print(f"[CACHE ERROR] {e}", flush=True)
         _cache_initialized = True
 
 
 def get_cached_memories() -> list[dict]:
-    """获取缓存的记忆（如果未初始化则先初始化）"""
+    """鑾峰彇缂撳瓨鐨勮蹇嗭紙濡傛灉鏈垵濮嬪寲鍒欏厛鍒濆鍖栵級"""
     global _cache_initialized
     if not _cache_initialized:
         init_memory_cache()
@@ -117,13 +117,13 @@ def get_cached_memories() -> list[dict]:
 
 
 def add_to_cache(memory: dict):
-    """添加记忆到缓存"""
+    """娣诲姞璁板繂鍒扮紦瀛?""
     global _memory_cache
     _memory_cache.append(memory)
 
 
 def update_cache(memory_id: int, **updates):
-    """更新缓存中的记忆"""
+    """鏇存柊缂撳瓨涓殑璁板繂"""
     global _memory_cache
     for m in _memory_cache:
         if m["id"] == memory_id:
@@ -132,7 +132,7 @@ def update_cache(memory_id: int, **updates):
 
 
 def remove_from_cache(memory_id: int):
-    """从缓存中删除记忆"""
+    """浠庣紦瀛樹腑鍒犻櫎璁板繂"""
     global _memory_cache
     _memory_cache = [m for m in _memory_cache if m["id"] != memory_id]
 
@@ -475,7 +475,7 @@ async def chat_completions(request):
         is_stream = bool(payload.get("stream"))
 
         if is_stream:
-            upstream_resp = UPSTREAM_SESSION.post(
+            upstream_resp = requests.post(
                 f"{model_cfg['base_url']}/chat/completions",
                 headers=headers,
                 json=payload,
@@ -508,7 +508,7 @@ async def chat_completions(request):
                 media_type=upstream_resp.headers.get("Content-Type", "text/event-stream")
             )
 
-        upstream_resp = UPSTREAM_SESSION.post(
+        upstream_resp = requests.post(
             f"{model_cfg['base_url']}/chat/completions",
             headers=headers,
             json=payload,
@@ -594,7 +594,7 @@ def _get_model_registry() -> dict:
 
 
 async def health_check(request):
-    """健康检查端点"""
+    """鍋ュ悍妫€鏌ョ鐐?""
     embedding_status = "enabled" if GEMINI_API_KEY else "disabled"
     return JSONResponse({
         "status": "ok",
@@ -652,7 +652,7 @@ async def recall_http(request):
     })
 
 
-# 创建 Starlette 应用
+# 鍒涘缓 Starlette 搴旂敤
 app = Starlette(
     routes=[
         Route("/", index),
@@ -666,21 +666,21 @@ app = Starlette(
 
 
 if __name__ == "__main__":
-    # 初始化数据库
+    # 鍒濆鍖栨暟鎹簱
     if DATABASE_URL:
-        print("初始化数据库...")
+        print("鍒濆鍖栨暟鎹簱...")
         init_db()
-        print("数据库初始化完成!")
+        print("鏁版嵁搴撳垵濮嬪寲瀹屾垚!")
 
-        # 初始化记忆缓存
-        print("加载记忆缓存...")
+        # 鍒濆鍖栬蹇嗙紦瀛?
+        print("鍔犺浇璁板繂缂撳瓨...")
         init_memory_cache()
 
-        # 检测 embedding 维度，如果是旧版（768维）则自动重新生成
+        # 妫€娴?embedding 缁村害锛屽鏋滄槸鏃х増锛?68缁达級鍒欒嚜鍔ㄩ噸鏂扮敓鎴?
         if GEMINI_API_KEY and _memory_cache:
             sample = _memory_cache[0].get("embedding", [])
             if sample and len(sample) == 768:
-                print(f"[AUTO-REGEN] 检测到旧版 embedding (768维)，正在自动升级到 3072 维...")
+                print(f"[AUTO-REGEN] 妫€娴嬪埌鏃х増 embedding (768缁?锛屾鍦ㄨ嚜鍔ㄥ崌绾у埌 3072 缁?..")
                 updated = 0
                 for m in _memory_cache:
                     try:
@@ -695,29 +695,30 @@ if __name__ == "__main__":
                             m["embedding"] = new_embedding
                             updated += 1
                     except Exception as e:
-                        print(f"[AUTO-REGEN ERROR] 记忆 #{m['id']}: {e}", flush=True)
-                print(f"[AUTO-REGEN] 完成！已更新 {updated} 条记忆的 embedding")
+                        print(f"[AUTO-REGEN ERROR] 璁板繂 #{m['id']}: {e}", flush=True)
+                print(f"[AUTO-REGEN] 瀹屾垚锛佸凡鏇存柊 {updated} 鏉¤蹇嗙殑 embedding")
             elif sample:
-                print(f"[EMBEDDING] 当前维度: {len(sample)} (已是最新)")
+                print(f"[EMBEDDING] 褰撳墠缁村害: {len(sample)} (宸叉槸鏈€鏂?")
     else:
-        print("警告: 未设置 DATABASE_URL，将无法保存数据")
+        print("璀﹀憡: 鏈缃?DATABASE_URL锛屽皢鏃犳硶淇濆瓨鏁版嵁")
 
     if GEMINI_API_KEY:
-        print(f"Gemini Embedding: 已启用 (缓存上限: {EMBEDDING_CACHE_MAX_SIZE})")
+        print(f"Gemini Embedding: 宸插惎鐢?(缂撳瓨涓婇檺: {EMBEDDING_CACHE_MAX_SIZE})")
     else:
-        print("Gemini Embedding: 未启用（将使用关键词搜索）")
+        print("Gemini Embedding: 鏈惎鐢紙灏嗕娇鐢ㄥ叧閿瘝鎼滅储锛?)
 
-    print(f"搜索模式: {SEARCH_MODE} ({'语义搜索' if SEARCH_MODE == 'semantic' else '关键词搜索'})")
-    print(f"返回结果数: {MAX_RESULTS}")
+    print(f"鎼滅储妯″紡: {SEARCH_MODE} ({'璇箟鎼滅储' if SEARCH_MODE == 'semantic' else '鍏抽敭璇嶆悳绱?})")
+    print(f"杩斿洖缁撴灉鏁? {MAX_RESULTS}")
 
-    # Railway 使用 PORT 环境变量
+    # Railway 浣跨敤 PORT 鐜鍙橀噺
     port = int(os.environ.get("PORT", 8000))
 
     print("=" * 50)
     print("Memory Server (PostgreSQL + Embedding)")
     print("=" * 50)
-    print(f"服务端口: {port}")
-    print("健康检查: /health")
+    print(f"鏈嶅姟绔彛: {port}")
+    print("鍋ュ悍妫€鏌? /health")
     print("=" * 50)
 
     uvicorn.run(app, host="0.0.0.0", port=port)
+
