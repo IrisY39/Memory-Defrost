@@ -72,7 +72,21 @@ UPSTREAM_SESSION.mount("http://", HTTPAdapter(pool_connections=50, pool_maxsize=
 # Cache parsed model registry to avoid reparsing MODELS_JSON on every request.
 _MODEL_REGISTRY_CACHE = None
 _RECENT_REQUESTS = {}
-REQUEST_DEDUP_WINDOW_SECONDS = float(os.environ.get("REQUEST_DEDUP_WINDOW_SECONDS", "2.0"))
+REQUEST_DEDUP_WINDOW_SECONDS = float(os.environ.get("REQUEST_DEDUP_WINDOW_SECONDS", "90.0"))
+
+
+def _build_dedupe_key(payload: dict) -> str:
+    """Build a stable dedupe key resilient to noisy client-side payload fields."""
+    query = extract_query_from_payload(payload) or ""
+    query_norm = " ".join(query.strip().split())
+    key_obj = {
+        "model": payload.get("model"),
+        "stream": bool(payload.get("stream")),
+        "query": query_norm,
+    }
+    return hashlib.sha256(
+        json.dumps(key_obj, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
 
 
 def init_memory_cache():
@@ -415,13 +429,17 @@ async def chat_completions(request):
         payload_fingerprint = hashlib.sha256(
             json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
         ).hexdigest()
+        query_for_log = extract_query_from_payload(payload) or ""
+        dedupe_key = _build_dedupe_key(payload)
         client_host = getattr(getattr(request, "client", None), "host", "unknown")
 
         # Simple in-memory dedupe for accidental client retries.
-        last_ts = _RECENT_REQUESTS.get(payload_fingerprint)
+        last_ts_payload = _RECENT_REQUESTS.get(payload_fingerprint)
+        last_ts_key = _RECENT_REQUESTS.get(dedupe_key)
+        last_ts = max([ts for ts in (last_ts_payload, last_ts_key) if ts is not None], default=None)
         if last_ts is not None and (now_ts - last_ts) < REQUEST_DEDUP_WINDOW_SECONDS:
             print(
-                f"deduped request fp={payload_fingerprint[:10]} "
+                f"deduped request fp={payload_fingerprint[:10]} key={dedupe_key[:10]} "
                 f"client={client_host} window={REQUEST_DEDUP_WINDOW_SECONDS}s",
                 flush=True
             )
@@ -430,14 +448,15 @@ async def chat_completions(request):
                 status_code=409
             )
         _RECENT_REQUESTS[payload_fingerprint] = now_ts
+        _RECENT_REQUESTS[dedupe_key] = now_ts
         if len(_RECENT_REQUESTS) > 2000:
             cutoff = now_ts - max(REQUEST_DEDUP_WINDOW_SECONDS * 5, 10.0)
             old_keys = [k for k, ts in _RECENT_REQUESTS.items() if ts < cutoff]
             for k in old_keys:
                 _RECENT_REQUESTS.pop(k, None)
         print(
-            f"incoming request fp={payload_fingerprint[:10]} client={client_host} "
-            f"stream={bool(payload.get('stream'))}",
+            f"incoming request fp={payload_fingerprint[:10]} key={dedupe_key[:10]} client={client_host} "
+            f"stream={bool(payload.get('stream'))} model={payload.get('model')} qlen={len(query_for_log)}",
             flush=True
         )
 
