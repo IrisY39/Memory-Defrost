@@ -285,18 +285,31 @@ def search_memories(query: str, memories: list[dict]) -> list[tuple[float, dict]
     results = list(scores_by_id.values())
     results.sort(key=lambda x: x[0], reverse=True)
 
+    final_results = results[:MAX_RESULTS]
+
     if DEBUG_RECALL_SCORES:
-        print(f"[RECALL SCORES] query='{query[:80]}' candidates={len(score_breakdown)} matched={len(results)}", flush=True)
-        for memory_id, item in score_breakdown.items():
+        print(
+            f"[RECALL SCORES] query='{query[:80]}' "
+            f"returned={len(final_results)} threshold_matched={len(results)}",
+            flush=True
+        )
+        for score, mem in final_results:
+            memory_id = mem["id"]
+            item = score_breakdown.get(memory_id, {})
+            semantic = item.get("semantic", 0.0)
+            keyword = item.get("keyword", 0.0)
+            priority_boost = item.get("priority_boost", 0.0)
+            priority = item.get("priority", mem.get("priority", 3))
+            preview = item.get("preview", mem.get("content", "")[:60].replace("\n", " "))
             print(
                 f"[RECALL SCORE] id={memory_id} "
-                f"semantic={item['semantic']} keyword={item['keyword']} "
-                f"priority_boost={item['priority_boost']} final={item['final']} "
-                f"priority={item['priority']} preview={item['preview']}",
+                f"semantic={semantic} keyword={keyword} "
+                f"priority_boost={priority_boost} final={round(float(score), 4)} "
+                f"priority={priority} preview={preview}",
                 flush=True
             )
 
-    return results[:MAX_RESULTS]
+    return final_results
 
 
 def search_memories_keyword(query: str, memories: list[dict], top_k: int = None) -> list[tuple[float, dict]]:
