@@ -102,7 +102,7 @@ def init_memory_cache():
                 "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None
             })
         _cache_initialized = True
-        print(f"[CACHE] 宸插姞杞?{len(_memory_cache)} 鏉¤蹇嗗埌鍐呭瓨", flush=True)
+        print(f"[CACHE] loaded {len(_memory_cache)} memories into cache", flush=True)
     except Exception as e:
         print(f"[CACHE ERROR] {e}", flush=True)
         _cache_initialized = True
