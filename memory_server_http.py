@@ -5,6 +5,7 @@
 
 import os
 import json
+import hashlib
 import requests
 import numpy as np
 from datetime import datetime
@@ -70,6 +71,8 @@ UPSTREAM_SESSION.mount("http://", HTTPAdapter(pool_connections=50, pool_maxsize=
 
 # Cache parsed model registry to avoid reparsing MODELS_JSON on every request.
 _MODEL_REGISTRY_CACHE = None
+_RECENT_REQUESTS = {}
+REQUEST_DEDUP_WINDOW_SECONDS = float(os.environ.get("REQUEST_DEDUP_WINDOW_SECONDS", "2.0"))
 
 
 def init_memory_cache():
@@ -414,6 +417,35 @@ def inject_memory_into_messages(payload: dict, memory_text: str) -> None:
 async def chat_completions(request):
     try:
         payload = await request.json()
+        now_ts = datetime.now().timestamp()
+        payload_fingerprint = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        client_host = getattr(getattr(request, "client", None), "host", "unknown")
+
+        # Simple in-memory dedupe for accidental client retries.
+        last_ts = _RECENT_REQUESTS.get(payload_fingerprint)
+        if last_ts is not None and (now_ts - last_ts) < REQUEST_DEDUP_WINDOW_SECONDS:
+            print(
+                f"deduped request fp={payload_fingerprint[:10]} "
+                f"client={client_host} window={REQUEST_DEDUP_WINDOW_SECONDS}s",
+                flush=True
+            )
+            return JSONResponse(
+                {"error": "duplicate request dropped"},
+                status_code=409
+            )
+        _RECENT_REQUESTS[payload_fingerprint] = now_ts
+        if len(_RECENT_REQUESTS) > 2000:
+            cutoff = now_ts - max(REQUEST_DEDUP_WINDOW_SECONDS * 5, 10.0)
+            old_keys = [k for k, ts in _RECENT_REQUESTS.items() if ts < cutoff]
+            for k in old_keys:
+                _RECENT_REQUESTS.pop(k, None)
+        print(
+            f"incoming request fp={payload_fingerprint[:10]} client={client_host} "
+            f"stream={bool(payload.get('stream'))}",
+            flush=True
+        )
 
         model_registry = _get_model_registry()
         if not model_registry["data"]:
