@@ -1,15 +1,13 @@
 # memory_server_http.py
-# 璁板繂鏈嶅姟 - 浜戠鐗堟湰 (HTTP 浼犺緭)
-# 浣跨敤 PostgreSQL + Gemini Embedding 璇箟鎼滅储
+# 记忆服务 - 云端版本 (HTTP 传输)
+# 使用 PostgreSQL + Gemini Embedding 语义搜索
 # HTTP memory service (no MCP)
 
 import os
 import json
-import hashlib
 import requests
 import numpy as np
 from datetime import datetime
-from requests.adapters import HTTPAdapter
 from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.responses import JSONResponse, Response, StreamingResponse
@@ -17,11 +15,11 @@ import uvicorn
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-# 閰嶇疆
+# 配置
 DATABASE_URL = os.environ.get("DATABASE_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-# 浣跨敤鏈€鏂扮殑 gemini-embedding-001锛?072缁达紝100+璇█鏀寔锛?
-# 娉ㄦ剰锛氬鏋滀粠 text-embedding-004 鍒囨崲锛岄渶瑕侀噸鏂扮敓鎴愭墍鏈?embedding
+# 使用最新的 gemini-embedding-001（3072维，100+语言支持）
+# 注意：如果从 text-embedding-004 切换，需要重新生成所有 embedding
 GEMINI_EMBEDDING_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent"
 
 # Gateway upstream config (for /v1/chat/completions)
@@ -30,7 +28,6 @@ UPSTREAM_BASE_URL = os.environ.get("BASE_URL")
 UPSTREAM_MODEL_NAME = os.environ.get("MODEL_NAME")
 MODELS_JSON = os.environ.get("MODELS_JSON")
 UPSTREAM_TIMEOUT = int(os.environ.get("UPSTREAM_TIMEOUT", "120"))
-UPSTREAM_CONNECT_TIMEOUT = int(os.environ.get("UPSTREAM_CONNECT_TIMEOUT", "60"))
 
 # Memory injection config
 MEMORY_PREFIX = os.environ.get(
@@ -40,57 +37,32 @@ MEMORY_PREFIX = os.environ.get(
 MEMORY_FAIL_OPEN = os.environ.get("MEMORY_FAIL_OPEN", "1") not in ("0", "false", "False")
 
 
-# 宸ュ叿鍚嶇О鍓嶇紑锛堢敤浜庡尯鍒嗗涓疄渚嬶紝閬垮厤閲嶅澹版槑閿欒锛?
+# 工具名称前缀（用于区分多个实例，避免重复声明错误）
 
-# Embedding 缂撳瓨锛堝噺灏?API 璋冪敤锛屽姞閫熷搷搴旓級
+# Embedding 缓存（减少 API 调用，加速响应）
 EMBEDDING_CACHE = {}
-EMBEDDING_CACHE_MAX_SIZE = 100  # 鏈€澶氱紦瀛?100 鏉?
+EMBEDDING_CACHE_MAX_SIZE = 100  # 最多缓存 100 条
 
-# 鎼滅储妯″紡锛歴emantic锛堣涔夋悳绱紝鏅鸿兘浣嗘參锛夋垨 keyword锛堝叧閿瘝鎼滅储锛屽揩浣嗛渶绮剧‘鍖归厤锛?
-# 璁剧疆鐜鍙橀噺 SEARCH_MODE 鏉ュ垏鎹紝榛樿涓?semantic
+# 搜索模式：semantic（语义搜索，智能但慢）或 keyword（关键词搜索，快但需精确匹配）
+# 设置环境变量 SEARCH_MODE 来切换，默认为 semantic
 SEARCH_MODE = os.environ.get("SEARCH_MODE", "semantic").lower()
-DEBUG_RECALL_SCORES = os.environ.get("DEBUG_RECALL_SCORES", "0") in ("1", "true", "True")
 
-# 杩斿洖缁撴灉鏁伴噺锛堥粯璁?3 鏉★紝鍑忓皯浼犺緭鍜屽鐞嗘椂闂达級
+# 返回结果数量（默认 3 条，减少传输和处理时间）
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "3"))
 
-# 娓愯繘寮忔敞鍏ワ細杩借釜 recall_memory 璋冪敤娆℃暟
-# 绠€鍗曞疄鐜帮細鍩轰簬鏃堕棿闂撮殧鍒ゆ柇鏄惁涓烘柊浼氳瘽
+# 渐进式注入：追踪 recall_memory 调用次数
+# 简单实现：基于时间间隔判断是否为新会话
 RECALL_COUNTER = {"count": 0, "last_call": None}
-RECALL_SESSION_TIMEOUT = 300  # 5 鍒嗛挓鏃犺皟鐢ㄨ涓烘柊浼氳瘽
+RECALL_SESSION_TIMEOUT = 300  # 5 分钟无调用视为新会话
 
-# ========== 璁板繂缂撳瓨 ==========
-# 缂撳瓨鎵€鏈夎蹇嗗埌鍐呭瓨锛岄伩鍏嶆瘡娆?recall 閮芥煡鏁版嵁搴?
+# ========== 记忆缓存 ==========
+# 缓存所有记忆到内存，避免每次 recall 都查数据库
 _memory_cache: list[dict] = []
 _cache_initialized = False
 
-# Reuse upstream TCP/TLS connections to reduce handshake latency/failures.
-UPSTREAM_SESSION = requests.Session()
-UPSTREAM_SESSION.mount("https://", HTTPAdapter(pool_connections=50, pool_maxsize=50))
-UPSTREAM_SESSION.mount("http://", HTTPAdapter(pool_connections=50, pool_maxsize=50))
-
-# Cache parsed model registry to avoid reparsing MODELS_JSON on every request.
-_MODEL_REGISTRY_CACHE = None
-_RECENT_REQUESTS = {}
-REQUEST_DEDUP_WINDOW_SECONDS = float(os.environ.get("REQUEST_DEDUP_WINDOW_SECONDS", "90.0"))
-
-
-def _build_dedupe_key(payload: dict) -> str:
-    """Build a stable dedupe key resilient to noisy client-side payload fields."""
-    query = extract_query_from_payload(payload) or ""
-    query_norm = " ".join(query.strip().split())
-    key_obj = {
-        "model": payload.get("model"),
-        "stream": bool(payload.get("stream")),
-        "query": query_norm,
-    }
-    return hashlib.sha256(
-        json.dumps(key_obj, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    ).hexdigest()
-
 
 def init_memory_cache():
-    """Function docstring."""
+    """初始化记忆缓存（从数据库加载到内存）"""
     global _memory_cache, _cache_initialized
     if not DATABASE_URL:
         _cache_initialized = True
@@ -116,14 +88,14 @@ def init_memory_cache():
                 "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None
             })
         _cache_initialized = True
-        print(f"[CACHE] loaded {len(_memory_cache)} memories into cache", flush=True)
+        print(f"[CACHE] 已加载 {len(_memory_cache)} 条记忆到内存", flush=True)
     except Exception as e:
         print(f"[CACHE ERROR] {e}", flush=True)
         _cache_initialized = True
 
 
 def get_cached_memories() -> list[dict]:
-    """Function docstring."""
+    """获取缓存的记忆（如果未初始化则先初始化）"""
     global _cache_initialized
     if not _cache_initialized:
         init_memory_cache()
@@ -131,7 +103,13 @@ def get_cached_memories() -> list[dict]:
 
 
 def add_to_cache(memory: dict):
-    """Function docstring."""
+    """添加记忆到缓存"""
+    global _memory_cache
+    _memory_cache.append(memory)
+
+
+def update_cache(memory_id: int, **updates):
+    """更新缓存中的记忆"""
     global _memory_cache
     for m in _memory_cache:
         if m["id"] == memory_id:
@@ -140,7 +118,7 @@ def add_to_cache(memory: dict):
 
 
 def remove_from_cache(memory_id: int):
-    """Function docstring."""
+    """从缓存中删除记忆"""
     global _memory_cache
     _memory_cache = [m for m in _memory_cache if m["id"] != memory_id]
 
@@ -246,7 +224,6 @@ def search_memories(query: str, memories: list[dict]) -> list[tuple[float, dict]
     all_queries = [query]
 
     scores_by_id = {}
-    score_breakdown = {}
     for q in all_queries:
         q_embedding = get_embedding(q)
         q_lower = q.lower()
@@ -279,48 +256,13 @@ def search_memories(query: str, memories: list[dict]) -> list[tuple[float, dict]
 
             final_score = base_score + priority_boost
 
-            if DEBUG_RECALL_SCORES:
-                score_breakdown[memory_id] = {
-                    "semantic": round(float(semantic_score), 4),
-                    "keyword": round(float(keyword_score), 4),
-                    "priority_boost": round(float(priority_boost), 4),
-                    "final": round(float(final_score), 4),
-                    "priority": m.get("priority", 3),
-                    "preview": m["content"][:60].replace("\n", " ")
-                }
-
             if final_score > 0.25:
                 if memory_id not in scores_by_id or final_score > scores_by_id[memory_id][0]:
                     scores_by_id[memory_id] = (final_score, m)
 
     results = list(scores_by_id.values())
     results.sort(key=lambda x: x[0], reverse=True)
-
-    final_results = results[:MAX_RESULTS]
-
-    if DEBUG_RECALL_SCORES:
-        print(
-            f"[RECALL SCORES] query='{query[:80]}' "
-            f"returned={len(final_results)} threshold_matched={len(results)}",
-            flush=True
-        )
-        for score, mem in final_results:
-            memory_id = mem["id"]
-            item = score_breakdown.get(memory_id, {})
-            semantic = item.get("semantic", 0.0)
-            keyword = item.get("keyword", 0.0)
-            priority_boost = item.get("priority_boost", 0.0)
-            priority = item.get("priority", mem.get("priority", 3))
-            preview = item.get("preview", mem.get("content", "")[:60].replace("\n", " "))
-            print(
-                f"[RECALL SCORE] id={memory_id} "
-                f"semantic={semantic} keyword={keyword} "
-                f"priority_boost={priority_boost} final={round(float(score), 4)} "
-                f"priority={priority} preview={preview}",
-                flush=True
-            )
-
-    return final_results
+    return results[:MAX_RESULTS]
 
 
 def search_memories_keyword(query: str, memories: list[dict], top_k: int = None) -> list[tuple[float, dict]]:
@@ -425,40 +367,6 @@ def inject_memory_into_messages(payload: dict, memory_text: str) -> None:
 async def chat_completions(request):
     try:
         payload = await request.json()
-        now_ts = datetime.now().timestamp()
-        payload_fingerprint = hashlib.sha256(
-            json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-        ).hexdigest()
-        query_for_log = extract_query_from_payload(payload) or ""
-        dedupe_key = _build_dedupe_key(payload)
-        client_host = getattr(getattr(request, "client", None), "host", "unknown")
-
-        # Simple in-memory dedupe for accidental client retries.
-        last_ts_payload = _RECENT_REQUESTS.get(payload_fingerprint)
-        last_ts_key = _RECENT_REQUESTS.get(dedupe_key)
-        last_ts = max([ts for ts in (last_ts_payload, last_ts_key) if ts is not None], default=None)
-        if last_ts is not None and (now_ts - last_ts) < REQUEST_DEDUP_WINDOW_SECONDS:
-            print(
-                f"deduped request fp={payload_fingerprint[:10]} key={dedupe_key[:10]} "
-                f"client={client_host} window={REQUEST_DEDUP_WINDOW_SECONDS}s",
-                flush=True
-            )
-            return JSONResponse(
-                {"error": "duplicate request dropped"},
-                status_code=409
-            )
-        _RECENT_REQUESTS[payload_fingerprint] = now_ts
-        _RECENT_REQUESTS[dedupe_key] = now_ts
-        if len(_RECENT_REQUESTS) > 2000:
-            cutoff = now_ts - max(REQUEST_DEDUP_WINDOW_SECONDS * 5, 10.0)
-            old_keys = [k for k, ts in _RECENT_REQUESTS.items() if ts < cutoff]
-            for k in old_keys:
-                _RECENT_REQUESTS.pop(k, None)
-        print(
-            f"incoming request fp={payload_fingerprint[:10]} key={dedupe_key[:10]} client={client_host} "
-            f"stream={bool(payload.get('stream'))} model={payload.get('model')} qlen={len(query_for_log)}",
-            flush=True
-        )
 
         model_registry = _get_model_registry()
         if not model_registry["data"]:
@@ -488,11 +396,11 @@ async def chat_completions(request):
         is_stream = bool(payload.get("stream"))
 
         if is_stream:
-            upstream_resp = UPSTREAM_SESSION.post(
+            upstream_resp = requests.post(
                 f"{model_cfg['base_url']}/chat/completions",
                 headers=headers,
                 json=payload,
-                timeout=(UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_TIMEOUT),
+                timeout=UPSTREAM_TIMEOUT,
                 stream=True
             )
             print("upstream status:", upstream_resp.status_code)
@@ -509,9 +417,6 @@ async def chat_completions(request):
                     for chunk in upstream_resp.iter_content(chunk_size=1024):
                         if chunk:
                             yield chunk
-                except (requests.exceptions.RequestException, OSError, RuntimeError) as e:
-                    # Upstream/client disconnects are expected during streaming; end stream quietly.
-                    print("stream aborted:", e)
                 finally:
                     upstream_resp.close()
 
@@ -521,11 +426,11 @@ async def chat_completions(request):
                 media_type=upstream_resp.headers.get("Content-Type", "text/event-stream")
             )
 
-        upstream_resp = UPSTREAM_SESSION.post(
+        upstream_resp = requests.post(
             f"{model_cfg['base_url']}/chat/completions",
             headers=headers,
             json=payload,
-            timeout=(UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_TIMEOUT)
+            timeout=UPSTREAM_TIMEOUT
         )
 
         print("upstream status:", upstream_resp.status_code)
@@ -545,10 +450,6 @@ async def chat_completions(request):
 
 
 def _get_model_registry() -> dict:
-    global _MODEL_REGISTRY_CACHE
-    if _MODEL_REGISTRY_CACHE is not None:
-        return _MODEL_REGISTRY_CACHE
-
     # MODELS_JSON format:
     # {
     #   "default": "modelA",
@@ -575,17 +476,16 @@ def _get_model_registry() -> dict:
                     "created": 1677858242,
                     "owned_by": "memory-gateway"
                 })
-            _MODEL_REGISTRY_CACHE = {
+            return {
                 "default": data.get("default") if data.get("default") in by_id else (items[0]["id"] if items else None),
                 "data": items,
                 "by_id": by_id
             }
-            return _MODEL_REGISTRY_CACHE
         except Exception as e:
             print("model registry error:", e)
 
     if UPSTREAM_API_KEY and UPSTREAM_BASE_URL and UPSTREAM_MODEL_NAME:
-        _MODEL_REGISTRY_CACHE = {
+        return {
             "default": UPSTREAM_MODEL_NAME,
             "data": [{
                 "id": UPSTREAM_MODEL_NAME,
@@ -600,14 +500,11 @@ def _get_model_registry() -> dict:
                 }
             }
         }
-        return _MODEL_REGISTRY_CACHE
-
-    _MODEL_REGISTRY_CACHE = {"default": None, "data": [], "by_id": {}}
-    return _MODEL_REGISTRY_CACHE
+    return {"default": None, "data": [], "by_id": {}}
 
 
 async def health_check(request):
-    """Function docstring."""
+    """健康检查端点"""
     embedding_status = "enabled" if GEMINI_API_KEY else "disabled"
     return JSONResponse({
         "status": "ok",
@@ -627,7 +524,7 @@ async def sse_compat(request):
 
 
 async def recall_http(request):
-    """Function docstring."""
+    """REST: recall memories by query."""
     try:
         body = await request.json()
     except Exception:
@@ -665,7 +562,7 @@ async def recall_http(request):
     })
 
 
-# 鍒涘缓 Starlette 搴旂敤
+# 创建 Starlette 应用
 app = Starlette(
     routes=[
         Route("/", index),
@@ -679,28 +576,58 @@ app = Starlette(
 
 
 if __name__ == "__main__":
+    # 初始化数据库
     if DATABASE_URL:
-        print("Initializing database...")
+        print("初始化数据库...")
         init_db()
-        print("Database initialized.")
-        print("Loading memory cache...")
+        print("数据库初始化完成!")
+
+        # 初始化记忆缓存
+        print("加载记忆缓存...")
         init_memory_cache()
+
+        # 检测 embedding 维度，如果是旧版（768维）则自动重新生成
+        if GEMINI_API_KEY and _memory_cache:
+            sample = _memory_cache[0].get("embedding", [])
+            if sample and len(sample) == 768:
+                print(f"[AUTO-REGEN] 检测到旧版 embedding (768维)，正在自动升级到 3072 维...")
+                updated = 0
+                for m in _memory_cache:
+                    try:
+                        new_embedding = get_embedding(m["content"], use_cache=False)
+                        if new_embedding:
+                            conn = get_db_connection()
+                            cur = conn.cursor()
+                            cur.execute("UPDATE memories SET embedding = %s WHERE id = %s", (new_embedding, m["id"]))
+                            conn.commit()
+                            cur.close()
+                            conn.close()
+                            m["embedding"] = new_embedding
+                            updated += 1
+                    except Exception as e:
+                        print(f"[AUTO-REGEN ERROR] 记忆 #{m['id']}: {e}", flush=True)
+                print(f"[AUTO-REGEN] 完成！已更新 {updated} 条记忆的 embedding")
+            elif sample:
+                print(f"[EMBEDDING] 当前维度: {len(sample)} (已是最新)")
     else:
-        print("Warning: DATABASE_URL is not set.")
+        print("警告: 未设置 DATABASE_URL，将无法保存数据")
 
     if GEMINI_API_KEY:
-        print(f"Gemini Embedding enabled (cache max: {EMBEDDING_CACHE_MAX_SIZE})")
+        print(f"Gemini Embedding: 已启用 (缓存上限: {EMBEDDING_CACHE_MAX_SIZE})")
     else:
-        print("Gemini Embedding disabled (keyword fallback mode).")
+        print("Gemini Embedding: 未启用（将使用关键词搜索）")
 
-    print(f"Search mode: {SEARCH_MODE}")
-    print(f"Max results: {MAX_RESULTS}")
+    print(f"搜索模式: {SEARCH_MODE} ({'语义搜索' if SEARCH_MODE == 'semantic' else '关键词搜索'})")
+    print(f"返回结果数: {MAX_RESULTS}")
 
+    # Railway 使用 PORT 环境变量
     port = int(os.environ.get("PORT", 8000))
+
     print("=" * 50)
     print("Memory Server (PostgreSQL + Embedding)")
     print("=" * 50)
-    print(f"Port: {port}")
-    print("Health: /health")
+    print(f"服务端口: {port}")
+    print("健康检查: /health")
     print("=" * 50)
+
     uvicorn.run(app, host="0.0.0.0", port=port)
