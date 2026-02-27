@@ -30,7 +30,7 @@ UPSTREAM_BASE_URL = os.environ.get("BASE_URL")
 UPSTREAM_MODEL_NAME = os.environ.get("MODEL_NAME")
 MODELS_JSON = os.environ.get("MODELS_JSON")
 UPSTREAM_TIMEOUT = int(os.environ.get("UPSTREAM_TIMEOUT", "120"))
-UPSTREAM_CONNECT_TIMEOUT = int(os.environ.get("UPSTREAM_CONNECT_TIMEOUT", "15"))
+UPSTREAM_CONNECT_TIMEOUT = int(os.environ.get("UPSTREAM_CONNECT_TIMEOUT", "60"))
 
 # Memory injection config
 MEMORY_PREFIX = os.environ.get(
@@ -469,7 +469,7 @@ async def chat_completions(request):
         is_stream = bool(payload.get("stream"))
 
         if is_stream:
-            upstream_resp = requests.post(
+            upstream_resp = UPSTREAM_SESSION.post(
                 f"{model_cfg['base_url']}/chat/completions",
                 headers=headers,
                 json=payload,
@@ -502,7 +502,7 @@ async def chat_completions(request):
                 media_type=upstream_resp.headers.get("Content-Type", "text/event-stream")
             )
 
-        upstream_resp = requests.post(
+        upstream_resp = UPSTREAM_SESSION.post(
             f"{model_cfg['base_url']}/chat/completions",
             headers=headers,
             json=payload,
