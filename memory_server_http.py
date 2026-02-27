@@ -8,6 +8,7 @@ import json
 import requests
 import numpy as np
 from datetime import datetime
+from requests.adapters import HTTPAdapter
 from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.responses import JSONResponse, Response, StreamingResponse
@@ -28,6 +29,7 @@ UPSTREAM_BASE_URL = os.environ.get("BASE_URL")
 UPSTREAM_MODEL_NAME = os.environ.get("MODEL_NAME")
 MODELS_JSON = os.environ.get("MODELS_JSON")
 UPSTREAM_TIMEOUT = int(os.environ.get("UPSTREAM_TIMEOUT", "120"))
+UPSTREAM_CONNECT_TIMEOUT = int(os.environ.get("UPSTREAM_CONNECT_TIMEOUT", "15"))
 
 # Memory injection config
 MEMORY_PREFIX = os.environ.get(
@@ -46,6 +48,7 @@ EMBEDDING_CACHE_MAX_SIZE = 100  # 最多缓存 100 条
 # 搜索模式：semantic（语义搜索，智能但慢）或 keyword（关键词搜索，快但需精确匹配）
 # 设置环境变量 SEARCH_MODE 来切换，默认为 semantic
 SEARCH_MODE = os.environ.get("SEARCH_MODE", "semantic").lower()
+DEBUG_RECALL_SCORES = os.environ.get("DEBUG_RECALL_SCORES", "0") in ("1", "true", "True")
 
 # 返回结果数量（默认 3 条，减少传输和处理时间）
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "3"))
@@ -59,6 +62,14 @@ RECALL_SESSION_TIMEOUT = 300  # 5 分钟无调用视为新会话
 # 缓存所有记忆到内存，避免每次 recall 都查数据库
 _memory_cache: list[dict] = []
 _cache_initialized = False
+
+# Reuse upstream TCP/TLS connections to reduce handshake latency/failures.
+UPSTREAM_SESSION = requests.Session()
+UPSTREAM_SESSION.mount("https://", HTTPAdapter(pool_connections=50, pool_maxsize=50))
+UPSTREAM_SESSION.mount("http://", HTTPAdapter(pool_connections=50, pool_maxsize=50))
+
+# Cache parsed model registry to avoid reparsing MODELS_JSON on every request.
+_MODEL_REGISTRY_CACHE = None
 
 
 def init_memory_cache():
@@ -224,6 +235,7 @@ def search_memories(query: str, memories: list[dict]) -> list[tuple[float, dict]
     all_queries = [query]
 
     scores_by_id = {}
+    score_breakdown = {}
     for q in all_queries:
         q_embedding = get_embedding(q)
         q_lower = q.lower()
@@ -256,12 +268,34 @@ def search_memories(query: str, memories: list[dict]) -> list[tuple[float, dict]
 
             final_score = base_score + priority_boost
 
+            if DEBUG_RECALL_SCORES:
+                score_breakdown[memory_id] = {
+                    "semantic": round(float(semantic_score), 4),
+                    "keyword": round(float(keyword_score), 4),
+                    "priority_boost": round(float(priority_boost), 4),
+                    "final": round(float(final_score), 4),
+                    "priority": m.get("priority", 3),
+                    "preview": m["content"][:60].replace("\n", " ")
+                }
+
             if final_score > 0.25:
                 if memory_id not in scores_by_id or final_score > scores_by_id[memory_id][0]:
                     scores_by_id[memory_id] = (final_score, m)
 
     results = list(scores_by_id.values())
     results.sort(key=lambda x: x[0], reverse=True)
+
+    if DEBUG_RECALL_SCORES:
+        print(f"[RECALL SCORES] query='{query[:80]}' candidates={len(score_breakdown)} matched={len(results)}", flush=True)
+        for memory_id, item in score_breakdown.items():
+            print(
+                f"[RECALL SCORE] id={memory_id} "
+                f"semantic={item['semantic']} keyword={item['keyword']} "
+                f"priority_boost={item['priority_boost']} final={item['final']} "
+                f"priority={item['priority']} preview={item['preview']}",
+                flush=True
+            )
+
     return results[:MAX_RESULTS]
 
 
@@ -396,11 +430,11 @@ async def chat_completions(request):
         is_stream = bool(payload.get("stream"))
 
         if is_stream:
-            upstream_resp = requests.post(
+            upstream_resp = UPSTREAM_SESSION.post(
                 f"{model_cfg['base_url']}/chat/completions",
                 headers=headers,
                 json=payload,
-                timeout=UPSTREAM_TIMEOUT,
+                timeout=(UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_TIMEOUT),
                 stream=True
             )
             print("upstream status:", upstream_resp.status_code)
@@ -417,6 +451,9 @@ async def chat_completions(request):
                     for chunk in upstream_resp.iter_content(chunk_size=1024):
                         if chunk:
                             yield chunk
+                except (requests.exceptions.RequestException, OSError, RuntimeError) as e:
+                    # Upstream/client disconnects are expected during streaming; end stream quietly.
+                    print("stream aborted:", e)
                 finally:
                     upstream_resp.close()
 
@@ -426,11 +463,11 @@ async def chat_completions(request):
                 media_type=upstream_resp.headers.get("Content-Type", "text/event-stream")
             )
 
-        upstream_resp = requests.post(
+        upstream_resp = UPSTREAM_SESSION.post(
             f"{model_cfg['base_url']}/chat/completions",
             headers=headers,
             json=payload,
-            timeout=UPSTREAM_TIMEOUT
+            timeout=(UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_TIMEOUT)
         )
 
         print("upstream status:", upstream_resp.status_code)
@@ -450,6 +487,10 @@ async def chat_completions(request):
 
 
 def _get_model_registry() -> dict:
+    global _MODEL_REGISTRY_CACHE
+    if _MODEL_REGISTRY_CACHE is not None:
+        return _MODEL_REGISTRY_CACHE
+
     # MODELS_JSON format:
     # {
     #   "default": "modelA",
@@ -476,16 +517,17 @@ def _get_model_registry() -> dict:
                     "created": 1677858242,
                     "owned_by": "memory-gateway"
                 })
-            return {
+            _MODEL_REGISTRY_CACHE = {
                 "default": data.get("default") if data.get("default") in by_id else (items[0]["id"] if items else None),
                 "data": items,
                 "by_id": by_id
             }
+            return _MODEL_REGISTRY_CACHE
         except Exception as e:
             print("model registry error:", e)
 
     if UPSTREAM_API_KEY and UPSTREAM_BASE_URL and UPSTREAM_MODEL_NAME:
-        return {
+        _MODEL_REGISTRY_CACHE = {
             "default": UPSTREAM_MODEL_NAME,
             "data": [{
                 "id": UPSTREAM_MODEL_NAME,
@@ -500,7 +542,10 @@ def _get_model_registry() -> dict:
                 }
             }
         }
-    return {"default": None, "data": [], "by_id": {}}
+        return _MODEL_REGISTRY_CACHE
+
+    _MODEL_REGISTRY_CACHE = {"default": None, "data": [], "by_id": {}}
+    return _MODEL_REGISTRY_CACHE
 
 
 async def health_check(request):
