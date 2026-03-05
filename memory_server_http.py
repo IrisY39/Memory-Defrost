@@ -28,6 +28,7 @@ UPSTREAM_BASE_URL = os.environ.get("BASE_URL")
 UPSTREAM_MODEL_NAME = os.environ.get("MODEL_NAME")
 MODELS_JSON = os.environ.get("MODELS_JSON")
 UPSTREAM_TIMEOUT = int(os.environ.get("UPSTREAM_TIMEOUT", "120"))
+STREAM_LOG_BYTES = int(os.environ.get("STREAM_LOG_BYTES", "0"))
 
 # Memory injection config
 MEMORY_PREFIX = os.environ.get(
@@ -413,9 +414,18 @@ async def chat_completions(request):
                 )
 
             def generate():
+                logged = 0
                 try:
                     for chunk in upstream_resp.iter_content(chunk_size=1024):
                         if chunk:
+                            if STREAM_LOG_BYTES > 0 and logged < STREAM_LOG_BYTES:
+                                take = min(len(chunk), STREAM_LOG_BYTES - logged)
+                                try:
+                                    preview = chunk[:take].decode("utf-8", errors="replace")
+                                except Exception:
+                                    preview = repr(chunk[:take])
+                                print(f"[STREAM PREVIEW] {preview}", flush=True)
+                                logged += take
                             yield chunk
                 finally:
                     upstream_resp.close()
