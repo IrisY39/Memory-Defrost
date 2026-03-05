@@ -415,17 +415,39 @@ async def chat_completions(request):
 
             def generate():
                 logged = 0
+                sse_buffer = ""
                 try:
                     for chunk in upstream_resp.iter_content(chunk_size=1024):
                         if chunk:
                             if STREAM_LOG_BYTES > 0 and logged < STREAM_LOG_BYTES:
-                                take = min(len(chunk), STREAM_LOG_BYTES - logged)
                                 try:
-                                    preview = chunk[:take].decode("utf-8", errors="replace")
+                                    sse_buffer += chunk.decode("utf-8", errors="replace")
                                 except Exception:
-                                    preview = repr(chunk[:take])
-                                print(f"[STREAM PREVIEW] {preview}", flush=True)
-                                logged += take
+                                    sse_buffer += repr(chunk)
+
+                                # Process complete lines only.
+                                lines = sse_buffer.split("\n")
+                                sse_buffer = lines.pop() if lines else ""
+                                for line in lines:
+                                    line = line.strip()
+                                    if not line.startswith("data:"):
+                                        continue
+                                    data = line[5:].strip()
+                                    if data == "[DONE]":
+                                        continue
+                                    try:
+                                        obj = json.loads(data)
+                                        delta = obj.get("choices", [{}])[0].get("delta", {})
+                                        text = delta.get("content", "")
+                                    except Exception:
+                                        text = ""
+                                    if text:
+                                        remaining = STREAM_LOG_BYTES - logged
+                                        if remaining <= 0:
+                                            break
+                                        out = text[:remaining]
+                                        print(f"[STREAM TEXT] {out}", flush=True)
+                                        logged += len(out)
                             yield chunk
                 finally:
                     upstream_resp.close()
