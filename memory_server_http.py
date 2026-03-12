@@ -437,6 +437,7 @@ async def chat_completions(request):
                 stopped = False
                 full_text = ""
                 raw_lines = []
+                sent_done = False
                 try:
                     for chunk in upstream_resp.iter_content(chunk_size=1024):
                         if not chunk:
@@ -466,6 +467,7 @@ async def chat_completions(request):
                             data = line[5:].strip()
                             if data == "[DONE]":
                                 out_lines.append("data: [DONE]")
+                                sent_done = True
                                 stopped = True
                                 continue
 
@@ -516,6 +518,7 @@ async def chat_completions(request):
                                     full_text += trimmed
                             # Emit DONE and stop streaming.
                             out_lines.append("data: [DONE]")
+                            sent_done = True
                             stopped = True
 
                         if out_lines:
@@ -546,6 +549,9 @@ async def chat_completions(request):
 
                         if stopped:
                             return
+                    if not sent_done:
+                        # Ensure client sees a terminal DONE even if upstream didn't send one.
+                        yield b"data: [DONE]\n"
                 finally:
                     if LOG_STREAM_FULL and full_text:
                         print("[STREAM FULL] " + full_text, flush=True)
