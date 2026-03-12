@@ -33,6 +33,9 @@ STOP_SEQUENCES = [s.strip() for s in os.environ.get("STOP_SEQUENCES", "### USER,
 ENFORCE_STOP = os.environ.get("ENFORCE_STOP", "1") not in ("0", "false", "False")
 LOG_STREAM_FULL = os.environ.get("LOG_STREAM_FULL", "0") in ("1", "true", "True")
 LOG_STREAM_RAW = os.environ.get("LOG_STREAM_RAW", "0") in ("1", "true", "True")
+CANCEL_PREVIOUS_STREAM = os.environ.get("CANCEL_PREVIOUS_STREAM", "1") not in ("0", "false", "False")
+
+_INFLIGHT_STREAMS = {}
 
 # Memory injection config
 MEMORY_PREFIX = os.environ.get(
@@ -413,6 +416,14 @@ async def chat_completions(request):
         is_stream = bool(payload.get("stream"))
 
         if is_stream:
+            client_key = getattr(getattr(request, "client", None), "host", "unknown")
+            if CANCEL_PREVIOUS_STREAM:
+                prev = _INFLIGHT_STREAMS.get(client_key)
+                if isinstance(prev, dict):
+                    prev["cancelled"] = True
+                _INFLIGHT_STREAMS[client_key] = {"cancelled": False}
+            stream_state = _INFLIGHT_STREAMS.get(client_key, {"cancelled": False})
+
             upstream_resp = requests.post(
                 f"{model_cfg['base_url']}/chat/completions",
                 headers=headers,
@@ -440,6 +451,9 @@ async def chat_completions(request):
                 sent_done = False
                 try:
                     for chunk in upstream_resp.iter_content(chunk_size=1024):
+                        if stream_state.get("cancelled"):
+                            yield b"data: [DONE]\n"
+                            return
                         if not chunk:
                             continue
 
