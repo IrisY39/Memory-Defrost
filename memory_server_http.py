@@ -563,10 +563,34 @@ async def chat_completions(request):
 
                         if stopped:
                             return
+                except Exception as e:
+                    print("stream aborted:", e)
+                finally:
+                    # Flush any remaining buffered line when upstream closes without newline.
+                    if sse_buffer:
+                        lines = [sse_buffer]
+                        sse_buffer = ""
+                        out_lines = []
+                        for line in lines:
+                            raw_line = line
+                            line = line.rstrip("\r")
+                            if LOG_STREAM_RAW:
+                                raw_lines.append(raw_line)
+                            if not line.startswith("data:"):
+                                out_lines.append(raw_line)
+                                continue
+                            data = line[5:].strip()
+                            if data == "[DONE]":
+                                out_lines.append("data: [DONE]")
+                                sent_done = True
+                                continue
+                            out_lines.append(raw_line)
+                        if out_lines:
+                            yield ("\n".join(out_lines) + "\n").encode("utf-8")
+
                     if not sent_done:
                         # Ensure client sees a terminal DONE even if upstream didn't send one.
                         yield b"data: [DONE]\n"
-                finally:
                     if LOG_STREAM_FULL and full_text:
                         print("[STREAM FULL] " + full_text, flush=True)
                     if LOG_STREAM_RAW and raw_lines:
