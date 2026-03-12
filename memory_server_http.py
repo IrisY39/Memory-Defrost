@@ -32,6 +32,7 @@ STREAM_LOG_BYTES = int(os.environ.get("STREAM_LOG_BYTES", "0"))
 STOP_SEQUENCES = [s.strip() for s in os.environ.get("STOP_SEQUENCES", "### USER,### ASSISTANT").split(",") if s.strip()]
 ENFORCE_STOP = os.environ.get("ENFORCE_STOP", "1") not in ("0", "false", "False")
 LOG_STREAM_FULL = os.environ.get("LOG_STREAM_FULL", "0") in ("1", "true", "True")
+LOG_STREAM_RAW = os.environ.get("LOG_STREAM_RAW", "0") in ("1", "true", "True")
 
 # Memory injection config
 MEMORY_PREFIX = os.environ.get(
@@ -435,6 +436,7 @@ async def chat_completions(request):
                 max_stop_len = max([len(s) for s in STOP_SEQUENCES], default=0)
                 stopped = False
                 full_text = ""
+                raw_lines = []
                 try:
                     for chunk in upstream_resp.iter_content(chunk_size=1024):
                         if not chunk:
@@ -453,6 +455,9 @@ async def chat_completions(request):
                         for line in lines:
                             raw_line = line
                             line = line.rstrip("\r")
+
+                            if LOG_STREAM_RAW:
+                                raw_lines.append(raw_line)
 
                             if not line.startswith("data:"):
                                 out_lines.append(raw_line)
@@ -544,6 +549,8 @@ async def chat_completions(request):
                 finally:
                     if LOG_STREAM_FULL and full_text:
                         print("[STREAM FULL] " + full_text, flush=True)
+                    if LOG_STREAM_RAW and raw_lines:
+                        print("[STREAM RAW] " + "\n".join(raw_lines), flush=True)
                     upstream_resp.close()
 
             return StreamingResponse(
