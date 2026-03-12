@@ -29,6 +29,9 @@ UPSTREAM_MODEL_NAME = os.environ.get("MODEL_NAME")
 MODELS_JSON = os.environ.get("MODELS_JSON")
 UPSTREAM_TIMEOUT = int(os.environ.get("UPSTREAM_TIMEOUT", "120"))
 STREAM_LOG_BYTES = int(os.environ.get("STREAM_LOG_BYTES", "0"))
+STOP_SEQUENCES = [s.strip() for s in os.environ.get("STOP_SEQUENCES", "### USER,### ASSISTANT").split(",") if s.strip()]
+ENFORCE_STOP = os.environ.get("ENFORCE_STOP", "1") not in ("0", "false", "False")
+LOG_STREAM_FULL = os.environ.get("LOG_STREAM_FULL", "0") in ("1", "true", "True")
 
 # Memory injection config
 MEMORY_PREFIX = os.environ.get(
@@ -383,6 +386,18 @@ async def chat_completions(request):
 
         payload["model"] = requested_model
 
+        if ENFORCE_STOP and STOP_SEQUENCES:
+            existing_stop = payload.get("stop")
+            merged = []
+            if isinstance(existing_stop, str):
+                merged = [existing_stop]
+            elif isinstance(existing_stop, list):
+                merged = existing_stop[:]
+            for s in STOP_SEQUENCES:
+                if s not in merged:
+                    merged.append(s)
+            payload["stop"] = merged
+
         query = extract_query_from_payload(payload)
         if query:
             memory_text = recall_memory_text(query)
@@ -416,40 +431,119 @@ async def chat_completions(request):
             def generate():
                 logged = 0
                 sse_buffer = ""
+                stop_tail = ""
+                max_stop_len = max([len(s) for s in STOP_SEQUENCES], default=0)
+                stopped = False
+                full_text = ""
                 try:
                     for chunk in upstream_resp.iter_content(chunk_size=1024):
-                        if chunk:
-                            if STREAM_LOG_BYTES > 0 and logged < STREAM_LOG_BYTES:
-                                try:
-                                    sse_buffer += chunk.decode("utf-8", errors="replace")
-                                except Exception:
-                                    sse_buffer += repr(chunk)
+                        if not chunk:
+                            continue
 
-                                # Process complete lines only.
-                                lines = sse_buffer.split("\n")
-                                sse_buffer = lines.pop() if lines else ""
-                                for line in lines:
-                                    line = line.strip()
-                                    if not line.startswith("data:"):
-                                        continue
-                                    data = line[5:].strip()
-                                    if data == "[DONE]":
-                                        continue
-                                    try:
-                                        obj = json.loads(data)
-                                        delta = obj.get("choices", [{}])[0].get("delta", {})
-                                        text = delta.get("content", "")
-                                    except Exception:
-                                        text = ""
-                                    if text:
-                                        remaining = STREAM_LOG_BYTES - logged
-                                        if remaining <= 0:
-                                            break
-                                        out = text[:remaining]
-                                        print(f"[STREAM TEXT] {out}", flush=True)
-                                        logged += len(out)
-                            yield chunk
+                        try:
+                            sse_buffer += chunk.decode("utf-8", errors="replace")
+                        except Exception:
+                            sse_buffer += repr(chunk)
+
+                        # Process complete lines only.
+                        lines = sse_buffer.split("\n")
+                        sse_buffer = lines.pop() if lines else ""
+                        out_lines = []
+
+                        for line in lines:
+                            raw_line = line
+                            line = line.rstrip("\r")
+
+                            if not line.startswith("data:"):
+                                out_lines.append(raw_line)
+                                continue
+
+                            data = line[5:].strip()
+                            if data == "[DONE]":
+                                out_lines.append("data: [DONE]")
+                                stopped = True
+                                continue
+
+                            try:
+                                obj = json.loads(data)
+                                delta = obj.get("choices", [{}])[0].get("delta", {})
+                                text = delta.get("content", "")
+                            except Exception:
+                                text = ""
+
+                            if not text or not ENFORCE_STOP or not STOP_SEQUENCES:
+                                out_lines.append(raw_line)
+                                if LOG_STREAM_FULL and text:
+                                    full_text += text
+                                continue
+
+                            # Detect stop sequences across chunk boundaries.
+                            scan = stop_tail + text
+                            hit_idx = None
+                            hit_seq = None
+                            for s in STOP_SEQUENCES:
+                                idx = scan.find(s)
+                                if idx != -1 and (hit_idx is None or idx < hit_idx):
+                                    hit_idx = idx
+                                    hit_seq = s
+
+                            if hit_idx is None:
+                                # No stop found, pass through.
+                                out_lines.append(raw_line)
+                                if LOG_STREAM_FULL and text:
+                                    full_text += text
+                                if max_stop_len > 1:
+                                    stop_tail = (scan)[-(max_stop_len - 1):]
+                                else:
+                                    stop_tail = ""
+                                continue
+
+                            # Stop found; trim output to before the stop marker.
+                            emit_len = max(0, hit_idx - len(stop_tail))
+                            trimmed = text[:emit_len]
+                            if trimmed:
+                                try:
+                                    obj["choices"][0]["delta"]["content"] = trimmed
+                                    out_lines.append("data: " + json.dumps(obj, ensure_ascii=False))
+                                except Exception:
+                                    out_lines.append(raw_line)
+                                if LOG_STREAM_FULL:
+                                    full_text += trimmed
+                            # Emit DONE and stop streaming.
+                            out_lines.append("data: [DONE]")
+                            stopped = True
+
+                        if out_lines:
+                            out_blob = "\n".join(out_lines) + "\n"
+
+                            if STREAM_LOG_BYTES > 0 and logged < STREAM_LOG_BYTES:
+                                # Best-effort text preview from this batch.
+                                try:
+                                    for line in out_lines:
+                                        if line.startswith("data:"):
+                                            data = line[5:].strip()
+                                            if data == "[DONE]":
+                                                continue
+                                            obj = json.loads(data)
+                                            delta = obj.get("choices", [{}])[0].get("delta", {})
+                                            text = delta.get("content", "")
+                                            if text:
+                                                remaining = STREAM_LOG_BYTES - logged
+                                                if remaining <= 0:
+                                                    break
+                                                out = text[:remaining]
+                                                print(f"[STREAM TEXT] {out}", flush=True)
+                                                logged += len(out)
+                                except Exception:
+                                    pass
+
+                            yield out_blob.encode("utf-8")
+
+                        if stopped:
+                            return
                 finally:
+                    if LOG_STREAM_FULL and full_text:
+                        print("[STREAM FULL] " + full_text, flush=True)
                     upstream_resp.close()
 
             return StreamingResponse(
