@@ -453,6 +453,7 @@ async def chat_completions(request):
                     for chunk in upstream_resp.iter_content(chunk_size=1024):
                         if stream_state.get("cancelled"):
                             yield b"data: [DONE]\n"
+                            print("[STREAM DONE] cancelled", flush=True)
                             return
                         if not chunk:
                             continue
@@ -483,6 +484,7 @@ async def chat_completions(request):
                                 out_lines.append("data: [DONE]")
                                 sent_done = True
                                 stopped = True
+                                print("[STREAM DONE] upstream", flush=True)
                                 continue
 
                             try:
@@ -534,6 +536,7 @@ async def chat_completions(request):
                             out_lines.append("data: [DONE]")
                             sent_done = True
                             stopped = True
+                            print("[STREAM DONE] stop-trim", flush=True)
 
                         if out_lines:
                             out_blob = "\n".join(out_lines) + "\n"
@@ -591,6 +594,7 @@ async def chat_completions(request):
                     if not sent_done:
                         # Ensure client sees a terminal DONE even if upstream didn't send one.
                         yield b"data: [DONE]\n"
+                        print("[STREAM DONE] forced", flush=True)
                     if LOG_STREAM_FULL and full_text:
                         print("[STREAM FULL] " + full_text, flush=True)
                     if LOG_STREAM_RAW and raw_lines:
