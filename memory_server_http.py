@@ -34,6 +34,7 @@ ENFORCE_STOP = os.environ.get("ENFORCE_STOP", "1") not in ("0", "false", "False"
 LOG_STREAM_FULL = os.environ.get("LOG_STREAM_FULL", "0") in ("1", "true", "True")
 LOG_STREAM_RAW = os.environ.get("LOG_STREAM_RAW", "0") in ("1", "true", "True")
 CANCEL_PREVIOUS_STREAM = os.environ.get("CANCEL_PREVIOUS_STREAM", "1") not in ("0", "false", "False")
+LOG_RAW_REQUEST = os.environ.get("LOG_RAW_REQUEST", "0") in ("1", "true", "True")
 
 _INFLIGHT_STREAMS = {}
 
@@ -375,6 +376,11 @@ def inject_memory_into_messages(payload: dict, memory_text: str) -> None:
 async def chat_completions(request):
     try:
         payload = await request.json()
+        if LOG_RAW_REQUEST:
+            try:
+                print("[RAW REQUEST] " + json.dumps(payload, ensure_ascii=False), flush=True)
+            except Exception:
+                print("[RAW REQUEST] <unserializable payload>", flush=True)
 
         model_registry = _get_model_registry()
         if not model_registry["data"]:
