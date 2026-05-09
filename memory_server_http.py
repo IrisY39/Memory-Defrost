@@ -51,6 +51,7 @@ MEMORY_FAIL_OPEN = os.environ.get("MEMORY_FAIL_OPEN", "1") not in ("0", "false",
 # Embedding 缓存（减少 API 调用，加速响应）
 EMBEDDING_CACHE = {}
 EMBEDDING_CACHE_MAX_SIZE = 100  # 最多缓存 100 条
+EMBEDDING_MAX_CHARS = int(os.environ.get("EMBEDDING_MAX_CHARS", "3000"))
 
 # 搜索模式：semantic（语义搜索，智能但慢）或 keyword（关键词搜索，快但需精确匹配）
 # 设置环境变量 SEARCH_MODE 来切换，默认为 semantic
@@ -180,6 +181,20 @@ def init_db():
 def get_embedding(text: str, use_cache: bool = True) -> list[float]:
     global EMBEDDING_CACHE
 
+    if not isinstance(text, str):
+        text = str(text)
+    text = text.strip()
+    if not text:
+        print("[EMBEDDING] empty input text", flush=True)
+        return []
+
+    if EMBEDDING_MAX_CHARS > 0 and len(text) > EMBEDDING_MAX_CHARS:
+        print(
+            f"[EMBEDDING] input too long ({len(text)}), truncated to {EMBEDDING_MAX_CHARS}",
+            flush=True
+        )
+        text = text[:EMBEDDING_MAX_CHARS]
+
     cache_key = text[:200].strip().lower()
     if use_cache and cache_key in EMBEDDING_CACHE:
         print("[EMBEDDING] cache hit", flush=True)
@@ -190,7 +205,7 @@ def get_embedding(text: str, use_cache: bool = True) -> list[float]:
         return []
 
     try:
-        print(f"[EMBEDDING] calling api for text: {text[:50]}", flush=True)
+        print(f"[EMBEDDING] calling api for text_len={len(text)} preview={text[:50]}", flush=True)
         url = f"{GEMINI_EMBEDDING_URL}?key={GEMINI_API_KEY}"
         payload = {"content": {"parts": [{"text": text}]}}
         response = requests.post(url, json=payload, timeout=10)
@@ -210,6 +225,7 @@ def get_embedding(text: str, use_cache: bool = True) -> list[float]:
             return embedding
         else:
             print("[EMBEDDING] API error:", response.status_code, flush=True)
+            print("[EMBEDDING] API error body:", response.text[:1000], flush=True)
     except Exception as e:
         print("[EMBEDDING] error:", e, flush=True)
     return []
