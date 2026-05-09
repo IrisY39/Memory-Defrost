@@ -20,7 +20,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 # 使用最新的 gemini-embedding-001（3072维，100+语言支持）
 # 注意：如果从 text-embedding-004 切换，需要重新生成所有 embedding
-GEMINI_EMBEDDING_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001"
+GEMINI_EMBEDDING_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent"
 
 # Gateway upstream config (for /v1/chat/completions)
 UPSTREAM_API_KEY = os.environ.get("OPENAI_API_KEY")
